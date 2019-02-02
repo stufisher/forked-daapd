@@ -30,9 +30,12 @@
 # include <config.h>
 #endif
 
+#include <errno.h>
+#include <limits.h>
 #include <regex.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
@@ -632,6 +635,11 @@ jsonapi_reply_config(struct httpd_request *hreq)
   json_object *buildopts;
   int websocket_port;
   char **buildoptions;
+  cfg_t *lib;
+  int ndirs;
+  char *path;
+  char *deref;
+  json_object *directories;
   int i;
 
   CHECK_NULL(L_WEB, jreply = json_object_new_object());
@@ -661,6 +669,28 @@ jsonapi_reply_config(struct httpd_request *hreq)
       json_object_array_add(buildopts, json_object_new_string(buildoptions[i]));
     }
   json_object_object_add(jreply, "buildoptions", buildopts);
+
+  // Library directories
+  lib = cfg_getsec(cfg, "library");
+  ndirs = cfg_size(lib, "directories");
+  directories = json_object_new_array();
+  for (i = 0; i < ndirs; i++)
+    {
+      path = cfg_getnstr(lib, "directories", i);
+
+      // The path in the conf file may have a trailing slash character. Return the realpath like it is done in the bulk_scan function in filescanner.c
+      deref = realpath(path, NULL);
+      if (deref)
+        {
+	  json_object_array_add(directories, json_object_new_string(deref));
+	  free(deref);
+	}
+      else
+	{
+	  DPRINTF(E_LOG, L_WEB, "Skipping library directory %s, could not dereference: %s\n", path, strerror(errno));
+	}
+    }
+  json_object_object_add(jreply, "directories", directories);
 
   CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->reply, "%s", json_object_to_json_string(jreply)));
 
@@ -1051,10 +1081,11 @@ struct outputs_param
 {
   json_object *output;
   uint64_t output_id;
+  int output_volume;
 };
 
 static json_object *
-speaker_to_json(struct spk_info *spk)
+speaker_to_json(struct player_speaker_info *spk)
 {
   json_object *output;
   char output_id[21];
@@ -1075,7 +1106,7 @@ speaker_to_json(struct spk_info *spk)
 }
 
 static void
-speaker_enum_cb(struct spk_info *spk, void *arg)
+speaker_enum_cb(struct player_speaker_info *spk, void *arg)
 {
   json_object *outputs;
   json_object *output;
@@ -1086,25 +1117,15 @@ speaker_enum_cb(struct spk_info *spk, void *arg)
   json_object_array_add(outputs, output);
 }
 
-static void
-speaker_get_cb(struct spk_info *spk, void *arg)
-{
-  struct outputs_param *outputs_param = arg;
-
-  if (outputs_param->output_id == spk->id)
-    {
-      outputs_param->output = speaker_to_json(spk);
-    }
-}
-
 /*
  * GET /api/outputs/[output_id]
  */
 static int
 jsonapi_reply_outputs_get_byid(struct httpd_request *hreq)
 {
-  struct outputs_param outputs_param;
+  struct player_speaker_info speaker_info;
   uint64_t output_id;
+  json_object *jreply;
   int ret;
 
   ret = safe_atou64(hreq->uri_parsed->path_parts[2], &output_id);
@@ -1115,21 +1136,19 @@ jsonapi_reply_outputs_get_byid(struct httpd_request *hreq)
       return HTTP_BADREQUEST;
     }
 
-  outputs_param.output_id = output_id;
-  outputs_param.output = NULL;
+  ret = player_speaker_get_byid(output_id, &speaker_info);
 
-  player_speaker_enumerate(speaker_get_cb, &outputs_param);
-
-  if (!outputs_param.output)
+  if (ret < 0)
     {
       DPRINTF(E_LOG, L_WEB, "No output found for '%s'\n", hreq->uri_parsed->path);
 
       return HTTP_BADREQUEST;
     }
 
-  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->reply, "%s", json_object_to_json_string(outputs_param.output)));
+  jreply = speaker_to_json(&speaker_info);
+  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->reply, "%s", json_object_to_json_string(jreply)));
 
-  jparse_free(outputs_param.output);
+  jparse_free(jreply);
 
   return HTTP_OK;
 }
@@ -1320,6 +1339,13 @@ play_item_with_id(const char *param)
   ret = player_playback_start_byitem(queue_item);
   free_queue_item(queue_item, 0);
 
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Failed to start playback from item with id '%d'\n", item_id);
+
+      return HTTP_INTERNAL;
+    }
+
   return HTTP_NOCONTENT;
 }
 
@@ -1352,6 +1378,13 @@ play_item_at_position(const char *param)
   player_playback_stop();
   ret = player_playback_start_byitem(queue_item);
   free_queue_item(queue_item, 0);
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Failed to start playback from position '%d'\n", position);
+
+      return HTTP_INTERNAL;
+    }
 
   return HTTP_NOCONTENT;
 }
@@ -1405,6 +1438,33 @@ jsonapi_reply_player_stop(struct httpd_request *hreq)
   if (ret < 0)
     {
       DPRINTF(E_LOG, L_WEB, "Error stopping playback.\n");
+      return HTTP_INTERNAL;
+    }
+
+  return HTTP_NOCONTENT;
+}
+
+static int
+jsonapi_reply_player_toggle(struct httpd_request *hreq)
+{
+  struct player_status status;
+  int ret;
+
+  player_get_status(&status);
+  DPRINTF(E_DBG, L_WEB, "Toggle playback request with current state %d.\n", status.status);
+
+  if (status.status == PLAY_PLAYING)
+    {
+      ret = player_playback_pause();
+    }
+  else
+    {
+      ret = player_playback_start();
+    }
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Error toggling playback state.\n");
       return HTTP_INTERNAL;
     }
 
@@ -1737,42 +1797,26 @@ queue_tracks_add_playlist(const char *id, int pos)
 }
 
 static int
-jsonapi_reply_queue_tracks_add(struct httpd_request *hreq)
+queue_tracks_add_byuris(const char *param, int pos, int *total_count)
 {
-  const char *param;
   char *uris;
   char *uri;
+  char *ptr;
   const char *id;
-  int pos = -1;
   int count = 0;
-  int ttl_count = 0;
-  json_object *reply;
   int ret = 0;
 
+  *total_count = 0;
 
-  param = evhttp_find_header(hreq->query, "position");
-  if (param)
+  CHECK_NULL(L_WEB, uris = strdup(param));
+  uri = strtok_r(uris, ",", &ptr);
+
+  if (!uri)
     {
-      if (safe_atoi32(param, &pos) < 0)
-        {
-	  DPRINTF(E_LOG, L_WEB, "Invalid position parameter '%s'\n", param);
-
-	  return HTTP_BADREQUEST;
-	}
-
-      DPRINTF(E_DBG, L_WEB, "Add tracks starting at position '%d\n", pos);
+      DPRINTF(E_LOG, L_WEB, "Empty query parameter 'uris'\n");
+      free(uris);
+      return -1;
     }
-
-  param = evhttp_find_header(hreq->query, "uris");
-  if (!param)
-    {
-      DPRINTF(E_LOG, L_WEB, "Missing query parameter 'uris'\n");
-
-      return HTTP_BADREQUEST;
-    }
-
-  uris = strdup(param);
-  uri = strtok(uris, ",");
 
   do
     {
@@ -1812,16 +1856,117 @@ jsonapi_reply_queue_tracks_add(struct httpd_request *hreq)
       if (pos >= 0)
 	pos += count;
 
-      ttl_count += count;
+      *total_count += count;
     }
-  while ((uri = strtok(NULL, ",")));
+  while ((uri = strtok_r(NULL, ",", &ptr)));
 
   free(uris);
+
+  return ret;
+}
+
+static int
+queue_tracks_add_byexpression(const char *param, int pos, int *total_count)
+{
+  char *expression;
+  struct smartpl smartpl_expression;
+  struct query_params query_params;
+  struct player_status status;
+  int ret;
+
+  memset(&query_params, 0, sizeof(struct query_params));
+
+  query_params.type = Q_ITEMS;
+  query_params.sort = S_ALBUM;
+  query_params.idx_type = I_NONE;
+
+  memset(&smartpl_expression, 0, sizeof(struct smartpl));
+  expression = safe_asprintf("\"query\" { %s }", param);
+  ret = smartpl_query_parse_string(&smartpl_expression, expression);
+  free(expression);
+
+  if (ret < 0)
+    return -1;
+
+  query_params.filter = strdup(smartpl_expression.query_where);
+  free_smartpl(&smartpl_expression, 1);
+
+  player_get_status(&status);
+
+  ret = db_queue_add_by_query(&query_params, status.shuffle, status.item_id, pos, total_count, NULL);
+
+  free(query_params.filter);
+
+  return ret;
+
+}
+
+static int
+jsonapi_reply_queue_tracks_add(struct httpd_request *hreq)
+{
+  const char *param_pos;
+  const char *param_uris;
+  const char *param_expression;
+  const char *param;
+  int pos = -1;
+  bool shuffle;
+  int total_count = 0;
+  json_object *reply;
+  int ret = 0;
+
+
+  param_pos = evhttp_find_header(hreq->query, "position");
+  if (param_pos)
+    {
+      if (safe_atoi32(param_pos, &pos) < 0)
+        {
+	  DPRINTF(E_LOG, L_WEB, "Invalid position parameter '%s'\n", param_pos);
+
+	  return HTTP_BADREQUEST;
+	}
+
+      DPRINTF(E_DBG, L_WEB, "Add tracks starting at position '%d\n", pos);
+    }
+
+  param_uris = evhttp_find_header(hreq->query, "uris");
+  param_expression = evhttp_find_header(hreq->query, "expression");
+
+  if (!param_uris && !param_expression)
+    {
+      DPRINTF(E_LOG, L_WEB, "Missing query parameter 'uris' or 'expression'\n");
+
+      return HTTP_BADREQUEST;
+    }
+
+  // if query parameter "clear" is "true", stop playback and clear the queue before adding new queue items
+  param = evhttp_find_header(hreq->query, "clear");
+  if (param && strcmp(param, "true") == 0)
+    {
+      player_playback_stop();
+      db_queue_clear(0);
+    }
+
+  // if query parameter "shuffle" is present, update the shuffle state before adding new queue items
+  param = evhttp_find_header(hreq->query, "shuffle");
+  if (param)
+    {
+      shuffle = (strcmp(param, "true") == 0);
+      player_shuffle_set(shuffle);
+    }
+
+  if (param_uris)
+    {
+      ret = queue_tracks_add_byuris(param_uris, pos, &total_count);
+    }
+  else
+    {
+      ret = queue_tracks_add_byexpression(param_expression, pos, &total_count);
+    }
 
   if (ret == 0)
     {
       reply = json_object_new_object();
-      json_object_object_add(reply, "count", json_object_new_int(ttl_count));
+      json_object_object_add(reply, "count", json_object_new_int(total_count));
 
       ret = evbuffer_add_printf(hreq->reply, "%s", json_object_to_json_string(reply));
       jparse_free(reply);
@@ -1829,6 +1974,13 @@ jsonapi_reply_queue_tracks_add(struct httpd_request *hreq)
 
   if (ret < 0)
     return HTTP_INTERNAL;
+
+  // If query parameter "playback" is "start", start playback after successfully adding new items
+  param = evhttp_find_header(hreq->query, "playback");
+  if (param && strcmp(param, "start") == 0)
+    {
+      player_playback_start();
+    }
 
   return HTTP_OK;
 }
@@ -2055,36 +2207,113 @@ jsonapi_reply_player_consume(struct httpd_request *hreq)
 }
 
 static int
+volume_set(int volume, int step)
+{
+  int new_volume;
+  struct player_status status;
+  int ret;
+
+  new_volume = volume;
+
+  if (step != 0)
+    {
+      // Calculate new volume from given step value
+      player_get_status(&status);
+      new_volume = status.volume + step;
+    }
+
+  // Make sure we are setting a correct value
+  new_volume = new_volume > 100 ? 100 : new_volume;
+  new_volume = new_volume < 0 ? 0 : new_volume;
+
+  ret = player_volume_set(new_volume);
+  return ret;
+}
+
+static int
+output_volume_set(int volume, int step, uint64_t output_id)
+{
+  int new_volume;
+  struct player_speaker_info speaker_info;
+  int ret;
+
+  new_volume = volume;
+
+  if (step != 0)
+    {
+      // Calculate new output volume from the given step value
+      ret = player_speaker_get_byid(output_id, &speaker_info);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_WEB, "No output found for the given output id .\n");
+	  return -1;
+	}
+
+      new_volume = speaker_info.absvol + step;
+    }
+
+  // Make sure we are setting a correct value
+  new_volume = new_volume > 100 ? 100 : new_volume;
+  new_volume = new_volume < 0 ? 0 : new_volume;
+
+  ret = player_volume_setabs_speaker(output_id, new_volume);
+  return ret;
+}
+
+static int
 jsonapi_reply_player_volume(struct httpd_request *hreq)
 {
+  const char *param_volume;
+  const char *param_step;
   const char *param;
   uint64_t output_id;
   int volume;
+  int step;
   int ret;
 
-  param = evhttp_find_header(hreq->query, "volume");
-  if (!param)
-    return HTTP_BADREQUEST;
+  volume = 0;
+  step = 0;
 
-  ret = safe_atoi32(param, &volume);
-  if (ret < 0)
-    return HTTP_BADREQUEST;
+  // Parse and validate parameters
+  param_volume = evhttp_find_header(hreq->query, "volume");
+  if (param_volume)
+    {
+      ret = safe_atoi32(param_volume, &volume);
+      if (ret < 0)
+	return HTTP_BADREQUEST;
+    }
 
-  if (volume < 0 || volume > 100)
-    return HTTP_BADREQUEST;
+  param_step = evhttp_find_header(hreq->query, "step");
+  if (param_step)
+    {
+      ret = safe_atoi32(param_step, &step);
+      if (ret < 0)
+	return HTTP_BADREQUEST;
+    }
+
+  if ((!param_volume && !param_step)
+      || (param_volume && param_step))
+    {
+      DPRINTF(E_LOG, L_WEB, "Invalid parameters for player/volume request. Either 'volume' or 'step' parameter required.\n");
+      return HTTP_BADREQUEST;
+    }
 
   param = evhttp_find_header(hreq->query, "output_id");
   if (param)
     {
+      // Update volume for individual output
       ret = safe_atou64(param, &output_id);
       if (ret < 0)
-	return HTTP_BADREQUEST;
-
-      ret = player_volume_setabs_speaker(output_id, volume);
+	{
+	  DPRINTF(E_LOG, L_WEB, "Invalid value for parameter 'output_id'. Output id must be an integer (output_id='%s').\n", param);
+	  return HTTP_BADREQUEST;
+	}
+      ret = output_volume_set(volume, step, output_id);
     }
   else
     {
-      ret = player_volume_set(volume);
+      // Update master volume
+      ret = volume_set(volume, step);
     }
 
   if (ret < 0)
@@ -2361,7 +2590,7 @@ jsonapi_reply_library_album_tracks(struct httpd_request *hreq)
   int total;
   int ret = 0;
 
-  db_update = (time_t) db_admin_getint64(DB_ADMIN_DB_UPDATE);
+  db_update = (time_t) db_admin_getint64(DB_ADMIN_DB_MODIFIED);
   if (db_update && httpd_request_not_modified_since(hreq->req, &db_update))
     return HTTP_NOTMODIFIED;
 
@@ -2401,6 +2630,110 @@ jsonapi_reply_library_album_tracks(struct httpd_request *hreq)
 
   if (ret < 0)
     return HTTP_INTERNAL;
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_library_tracks_get_byid(struct httpd_request *hreq)
+{
+  time_t db_update;
+  struct query_params query_params;
+  const char *track_id;
+  struct db_media_file_info dbmfi;
+  json_object *reply = NULL;
+  int ret = 0;
+
+  db_update = (time_t) db_admin_getint64(DB_ADMIN_DB_MODIFIED);
+  if (db_update && httpd_request_not_modified_since(hreq->req, &db_update))
+    return HTTP_NOTMODIFIED;
+
+
+  track_id = hreq->uri_parsed->path_parts[3];
+
+  memset(&query_params, 0, sizeof(struct query_params));
+
+  query_params.type = Q_ITEMS;
+  query_params.filter = db_mprintf("(f.id = %q)", track_id);
+
+  ret = db_query_start(&query_params);
+  if (ret < 0)
+    goto error;
+
+  ret = db_query_fetch_file(&query_params, &dbmfi);
+  if (ret < 0)
+    goto error;
+
+  if (dbmfi.id == 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Track with id '%s' not found.\n", track_id);
+      ret = -1;
+      goto error;
+    }
+
+  reply = track_to_json(&dbmfi);
+
+  ret = evbuffer_add_printf(hreq->reply, "%s", json_object_to_json_string(reply));
+  if (ret < 0)
+    DPRINTF(E_LOG, L_WEB, "browse: Couldn't add track to response buffer.\n");
+
+ error:
+  db_query_end(&query_params);
+  free(query_params.filter);
+  jparse_free(reply);
+
+  if (ret < 0)
+    return HTTP_INTERNAL;
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_library_tracks_put_byid(struct httpd_request *hreq)
+{
+  int track_id;
+  const char *param;
+  int val;
+  int ret;
+
+  ret = safe_atoi32(hreq->uri_parsed->path_parts[3], &track_id);
+  if (ret < 0)
+    return HTTP_INTERNAL;
+
+  // Update play_count/skip_count
+  param = evhttp_find_header(hreq->query, "play_count");
+  if (param)
+    {
+      if (strcmp(param, "increment") == 0)
+	{
+	  db_file_inc_playcount(track_id);
+	}
+      else if (strcmp(param, "reset") == 0)
+	{
+	  db_file_reset_playskip_count(track_id);
+	}
+      else
+	{
+	  DPRINTF(E_WARN, L_WEB, "Ignoring invalid play_count value '%s' for track '%d'.\n", param, track_id);
+	}
+    }
+
+  // Update rating
+  param = evhttp_find_header(hreq->query, "rating");
+  if (param)
+    {
+      ret = safe_atoi32(param, &val);
+      if (ret < 0)
+	return HTTP_BADREQUEST;
+
+      if (val >= 0 && val <= DB_FILES_RATING_MAX)
+      	ret = db_file_rating_update_byid(track_id, val);
+      else
+      	DPRINTF(E_WARN, L_WEB, "Ignoring invalid rating value '%d' for track '%d'.\n", val, track_id);
+
+      if (ret < 0)
+        return HTTP_INTERNAL;
+    }
 
   return HTTP_OK;
 }
@@ -2503,7 +2836,7 @@ jsonapi_reply_library_playlist_tracks(struct httpd_request *hreq)
   int total;
   int ret = 0;
 
-  db_update = (time_t) db_admin_getint64(DB_ADMIN_DB_UPDATE);
+  db_update = (time_t) db_admin_getint64(DB_ADMIN_DB_MODIFIED);
   if (db_update && httpd_request_not_modified_since(hreq->req, &db_update))
     return HTTP_NOTMODIFIED;
 
@@ -2726,7 +3059,7 @@ jsonapi_reply_library_files(struct httpd_request *hreq)
     goto error;
 
   query_params.type = Q_ITEMS;
-  query_params.sort = S_NAME;
+  query_params.sort = S_VPATH;
   query_params.filter = db_mprintf("(f.directory_id = %d)", directory_id);
 
   ret = fetch_tracks(&query_params, tracks_items, &total);
@@ -3119,6 +3452,7 @@ static struct httpd_uri_map adm_handlers[] =
     { EVHTTP_REQ_PUT,    "^/api/player/play$",                           jsonapi_reply_player_play },
     { EVHTTP_REQ_PUT,    "^/api/player/pause$",                          jsonapi_reply_player_pause },
     { EVHTTP_REQ_PUT,    "^/api/player/stop$",                           jsonapi_reply_player_stop },
+    { EVHTTP_REQ_PUT,    "^/api/player/toggle$",                         jsonapi_reply_player_toggle },
     { EVHTTP_REQ_PUT,    "^/api/player/next$",                           jsonapi_reply_player_next },
     { EVHTTP_REQ_PUT,    "^/api/player/previous$",                       jsonapi_reply_player_previous },
     { EVHTTP_REQ_PUT,    "^/api/player/shuffle$",                        jsonapi_reply_player_shuffle },
@@ -3144,6 +3478,8 @@ static struct httpd_uri_map adm_handlers[] =
     { EVHTTP_REQ_GET,    "^/api/library/albums$",                        jsonapi_reply_library_albums },
     { EVHTTP_REQ_GET,    "^/api/library/albums/[[:digit:]]+$",           jsonapi_reply_library_album },
     { EVHTTP_REQ_GET,    "^/api/library/albums/[[:digit:]]+/tracks$",    jsonapi_reply_library_album_tracks },
+    { EVHTTP_REQ_GET,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_get_byid },
+    { EVHTTP_REQ_PUT,    "^/api/library/tracks/[[:digit:]]+$",           jsonapi_reply_library_tracks_put_byid },
     { EVHTTP_REQ_GET,    "^/api/library/genres$",                        jsonapi_reply_library_genres},
     { EVHTTP_REQ_GET,    "^/api/library/count$",                         jsonapi_reply_library_count },
     { EVHTTP_REQ_GET,    "^/api/library/files$",                         jsonapi_reply_library_files },
@@ -3180,6 +3516,9 @@ jsonapi_request(struct evhttp_request *req, struct httpd_uri_parsed *uri_parsed)
   CHECK_NULL(L_WEB, hreq->reply = evbuffer_new());
 
   status_code = hreq->handler(hreq);
+
+  if (status_code >= 400)
+    DPRINTF(E_LOG, L_WEB, "JSON api request failed with error code %d (%s)\n", status_code, uri_parsed->uri);
 
   switch (status_code)
     {

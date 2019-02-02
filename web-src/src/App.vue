@@ -86,8 +86,13 @@ export default {
 
       const vm = this
 
+      var protocol = 'ws://'
+      if (window.location.protocol === 'https:') {
+        protocol = 'wss://'
+      }
+
       var socket = new ReconnectingWebSocket(
-        'ws://' + window.location.hostname + ':' + vm.$store.state.config.websocket_port,
+        protocol + window.location.hostname + ':' + vm.$store.state.config.websocket_port,
         'notify',
         { reconnectInterval: 3000 }
       )
@@ -95,7 +100,7 @@ export default {
       socket.onopen = function () {
         vm.$store.dispatch('add_notification', { text: 'Connection to server established', type: 'primary', topic: 'connection', timeout: 2000 })
         vm.reconnect_attempts = 0
-        socket.send(JSON.stringify({ notify: ['update', 'player', 'options', 'outputs', 'volume', 'spotify'] }))
+        socket.send(JSON.stringify({ notify: ['update', 'database', 'player', 'options', 'outputs', 'volume', 'spotify'] }))
 
         vm.update_outputs()
         vm.update_player_status()
@@ -112,7 +117,7 @@ export default {
       }
       socket.onmessage = function (response) {
         var data = JSON.parse(response.data)
-        if (data.notify.includes('update')) {
+        if (data.notify.includes('update') || data.notify.includes('database')) {
           vm.update_library_stats()
         }
         if (data.notify.includes('player') || data.notify.includes('options') || data.notify.includes('volume')) {

@@ -58,10 +58,9 @@
 // Inotify cookies are uint32_t
 #define INOTIFY_FAKE_COOKIE ((int64_t)1 << 32)
 
-#define DB_TYPE_CHAR     1
-#define DB_TYPE_INT      2
-#define DB_TYPE_INT64    3
-#define DB_TYPE_STRING   4
+#define DB_TYPE_INT      1
+#define DB_TYPE_INT64    2
+#define DB_TYPE_STRING   3
 
 // Flags that column value is set automatically by the db, e.g. by a trigger
 #define DB_FLAG_AUTO     (1 << 0)
@@ -174,8 +173,8 @@ static const struct col_type_map mfi_cols_map[] =
     { "disc",               mfi_offsetof(disc),               DB_TYPE_INT },
     { "total_discs",        mfi_offsetof(total_discs),        DB_TYPE_INT },
     { "bpm",                mfi_offsetof(bpm),                DB_TYPE_INT },
-    { "compilation",        mfi_offsetof(compilation),        DB_TYPE_CHAR },
-    { "artwork",            mfi_offsetof(artwork),            DB_TYPE_CHAR },
+    { "compilation",        mfi_offsetof(compilation),        DB_TYPE_INT },
+    { "artwork",            mfi_offsetof(artwork),            DB_TYPE_INT },
     { "rating",             mfi_offsetof(rating),             DB_TYPE_INT,    DB_FIXUP_STANDARD, DB_FLAG_NO_ZERO },
     { "play_count",         mfi_offsetof(play_count),         DB_TYPE_INT,    DB_FIXUP_STANDARD, DB_FLAG_NO_ZERO },
     { "skip_count",         mfi_offsetof(skip_count),         DB_TYPE_INT,    DB_FIXUP_STANDARD, DB_FLAG_NO_ZERO },
@@ -1034,7 +1033,6 @@ fixup_tags(struct fixup_ctx *ctx)
 		fixup_func[i](tag, ctx->map[j].fixup, ctx);
 		break;
 
-	      case DB_TYPE_CHAR:
 	      case DB_TYPE_INT:
 	      case DB_TYPE_INT64:
 		fixup_func[i](NULL, ctx->map[j].fixup, ctx);
@@ -1098,9 +1096,8 @@ bind_mfi(sqlite3_stmt *stmt, struct media_file_info *mfi)
 
       switch (mfi_cols_map[i].type)
 	{
-	  case DB_TYPE_CHAR:
 	  case DB_TYPE_INT:
-	    sqlite3_bind_int(stmt, n, *((uint32_t *)ptr));
+	    sqlite3_bind_int64(stmt, n, *((uint32_t *)ptr)); // Use _int64 because _int is for signed int32
 	    break;
 
 	  case DB_TYPE_INT64:
@@ -1616,6 +1613,10 @@ db_build_query_clause(struct query_params *qp)
 
   if (qp->type & Q_F_BROWSE)
     qc->group = sqlite3_mprintf("GROUP BY %s", browse_clause[qp->type & ~Q_F_BROWSE].group);
+  else if (qp->group)
+    qc->group = sqlite3_mprintf("GROUP BY %s", qp->group);
+  else
+    qc->group = sqlite3_mprintf("");
 
   if (qp->filter)
     qc->where = sqlite3_mprintf("WHERE f.disabled = 0 AND %s", qp->filter);
@@ -1623,9 +1624,9 @@ db_build_query_clause(struct query_params *qp)
     qc->where = sqlite3_mprintf("WHERE f.disabled = 0");
 
   if (qp->having && (qp->type & (Q_GROUP_ALBUMS | Q_GROUP_ARTISTS)))
-      qc->having = sqlite3_mprintf("HAVING %s", qp->having);
-    else
-      qc->having = sqlite3_mprintf("");
+    qc->having = sqlite3_mprintf("HAVING %s", qp->having);
+  else
+    qc->having = sqlite3_mprintf("");
 
   if (qp->order)
     qc->order = sqlite3_mprintf("ORDER BY %s", qp->order);
@@ -1707,7 +1708,7 @@ db_build_query_items(struct query_params *qp)
     return NULL;
 
   count = sqlite3_mprintf("SELECT COUNT(*) FROM files f %s;", qc->where);
-  query = sqlite3_mprintf("SELECT f.* FROM files f %s %s %s;", qc->where, qc->order, qc->index);
+  query = sqlite3_mprintf("SELECT f.* FROM files f %s %s %s %s;", qc->where, qc->group, qc->order, qc->index);
 
   db_free_query_clause(qc);
 
@@ -2539,6 +2540,7 @@ db_file_inc_playcount(int id)
 	       "     rating = CAST(((play_count + 1.0) / (play_count + skip_count + 2.0) * 100 * 0.75) + ((rating + ((100.0 - rating) / 2.0)) * 0.25) AS INT)" \
                " WHERE id = %d;"
   char *query;
+  int ret;
 
   if (db_rating_updates)
     query = sqlite3_mprintf(Q_TMPL_WITH_RATING, (int64_t)time(NULL), id);
@@ -2551,7 +2553,9 @@ db_file_inc_playcount(int id)
       return;
     }
 
-  db_query_run(query, 1, 0);
+  ret = db_query_run(query, 1, 0);
+  if (ret == 0)
+    db_admin_setint64(DB_ADMIN_DB_MODIFIED, (int64_t) time(NULL));
 #undef Q_TMPL
 #undef Q_TMPL_WITH_RATING
 }
@@ -2567,6 +2571,7 @@ db_file_inc_skipcount(int id)
 	       "     rating = CAST(((play_count + 1.0) / (play_count + skip_count + 2.0) * 100 * 0.75) + ((rating - (rating / 2.0)) * 0.25) AS INT)" \
                " WHERE id = %d;"
   char *query;
+  int ret;
 
   if (db_rating_updates)
     query = sqlite3_mprintf(Q_TMPL_WITH_RATING, (int64_t)time(NULL), id);
@@ -2579,9 +2584,32 @@ db_file_inc_skipcount(int id)
       return;
     }
 
-  db_query_run(query, 1, 0);
+  ret = db_query_run(query, 1, 0);
+  if (ret == 0)
+    db_admin_setint64(DB_ADMIN_DB_MODIFIED, (int64_t) time(NULL));
 #undef Q_TMPL
 #undef Q_TMPL_WITH_RATING
+}
+
+void
+db_file_reset_playskip_count(int id)
+{
+#define Q_TMPL "UPDATE files SET play_count = 0, skip_count = 0, time_played = 0, time_skipped = 0 WHERE id = %d;"
+  char *query;
+  int ret;
+
+  query = sqlite3_mprintf(Q_TMPL, id);
+  if (!query)
+    {
+      DPRINTF(E_LOG, L_DB, "Out of memory for query string\n");
+
+      return;
+    }
+
+  ret = db_query_run(query, 1, 0);
+  if (ret == 0)
+    db_admin_setint64(DB_ADMIN_DB_MODIFIED, (int64_t) time(NULL));
+#undef Q_TMPL
 }
 
 void
@@ -2885,12 +2913,6 @@ db_file_fetch_byquery(char *query)
     {
       switch (mfi_cols_map[i].type)
 	{
-	  case DB_TYPE_CHAR:
-	    cval = (char *)mfi + mfi_cols_map[i].offset;
-
-	    *cval = sqlite3_column_int(stmt, i);
-	    break;
-
 	  case DB_TYPE_INT:
 	    ival = (uint32_t *) ((char *)mfi + mfi_cols_map[i].offset);
 
@@ -3045,6 +3067,7 @@ db_file_seek_update(int id, uint32_t seek)
 {
 #define Q_TMPL "UPDATE files SET seek = %d WHERE id = %d;"
   char *query;
+  int ret;
 
   if (id == 0)
     return;
@@ -3057,8 +3080,26 @@ db_file_seek_update(int id, uint32_t seek)
       return;
     }
 
-  db_query_run(query, 1, 0);
+  ret = db_query_run(query, 1, 0);
+  if (ret == 0)
+    db_admin_setint64(DB_ADMIN_DB_MODIFIED, (int64_t) time(NULL));
 #undef Q_TMPL
+}
+
+static int
+db_file_rating_update(char *query)
+{
+  int ret;
+
+  ret = db_query_run(query, 1, 0);
+
+  if (ret == 0)
+    {
+      db_admin_setint64(DB_ADMIN_DB_MODIFIED, (int64_t) time(NULL));
+      listener_notify(LISTENER_RATING);
+    }
+
+  return ((ret < 0) ? -1 : sqlite3_changes(hdl));
 }
 
 int
@@ -3066,16 +3107,10 @@ db_file_rating_update_byid(uint32_t id, uint32_t rating)
 {
 #define Q_TMPL "UPDATE files SET rating = %d WHERE id = %d;"
   char *query;
-  int ret;
 
   query = sqlite3_mprintf(Q_TMPL, rating, id);
 
-  ret = db_query_run(query, 1, 0);
-
-  if (ret == 0)
-    listener_notify(LISTENER_RATING);
-
-  return ((ret < 0) ? -1 : sqlite3_changes(hdl));
+  return db_file_rating_update(query);
 #undef Q_TMPL
 }
 
@@ -3084,16 +3119,10 @@ db_file_rating_update_byvirtualpath(const char *virtual_path, uint32_t rating)
 {
 #define Q_TMPL "UPDATE files SET rating = %d WHERE virtual_path = %Q;"
   char *query;
-  int ret;
 
   query = sqlite3_mprintf(Q_TMPL, rating, virtual_path);
 
-  ret = db_query_run(query, 1, 0);
-
-  if (ret == 0)
-    listener_notify(LISTENER_RATING);
-
-  return ((ret < 0) ? -1 : sqlite3_changes(hdl));
+  return db_file_rating_update(query);
 #undef Q_TMPL
 }
 
@@ -4482,11 +4511,6 @@ admin_get(const char *key, short type, void *value)
 
   switch (type)
     {
-      case DB_TYPE_CHAR:
-	cval = (char *) value;
-	*cval = sqlite3_column_int(stmt, 0);
-	break;
-
       case DB_TYPE_INT:
 	ival = (int32_t *) value;
 

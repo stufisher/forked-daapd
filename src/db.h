@@ -71,6 +71,7 @@ enum query_type {
 #define DB_ADMIN_SCHEMA_VERSION "schema_version"
 #define DB_ADMIN_QUEUE_VERSION "queue_version"
 #define DB_ADMIN_DB_UPDATE "db_update"
+#define DB_ADMIN_DB_MODIFIED "db_modified"
 #define DB_ADMIN_START_TIME "start_time"
 #define DB_ADMIN_LASTFM_SESSION_KEY "lastfm_sk"
 #define DB_ADMIN_SPOTIFY_REFRESH_TOKEN "spotify_refresh_token"
@@ -93,6 +94,7 @@ struct query_params {
 
   char *having;
   char *order;
+  char *group;
 
   char *filter;
 
@@ -174,7 +176,7 @@ struct media_file_info {
 
   uint32_t bpm;          /* TBPM */
   uint32_t compilation;
-  char artwork;
+  uint32_t artwork;
   uint32_t rating;
 
   uint32_t play_count;
@@ -564,6 +566,9 @@ db_file_inc_playcount(int id);
 
 void
 db_file_inc_skipcount(int id);
+
+void
+db_file_reset_playskip_count(int id);
 
 void
 db_file_ping(int id);

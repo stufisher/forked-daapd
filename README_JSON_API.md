@@ -23,8 +23,8 @@ JSON-Object model:
 | Method    | Endpoint                                         | Description                          |
 | --------- | ------------------------------------------------ | ------------------------------------ |
 | GET       | [/api/player](#get-player-status)                | Get player status                    |
-| PUT       | [/api/player/play, /api/player/pause, /api/player/stop](#control-playback) | Start, pause or stop playback |
-| PUT       | [/api/player/next, /api/player/prev](#skip-tracks) | Skip forward or backward           |
+| PUT       | [/api/player/play, /api/player/pause, /api/player/stop, /api/player/toggle](#control-playback) | Start, pause or stop playback |
+| PUT       | [/api/player/next, /api/player/previous](#skip-tracks) | Skip forward or backward           |
 | PUT       | [/api/player/shuffle](#set-shuffle-mode)         | Set shuffle mode                     |
 | PUT       | [/api/player/consume](#set-consume-mode)         | Set consume mode                     |
 | PUT       | [/api/player/repeat](#set-repeat-mode)           | Set repeat mode                      |
@@ -93,6 +93,10 @@ PUT /api/player/pause
 PUT /api/player/stop
 ```
 
+```http
+PUT /api/player/toggle
+```
+
 **Response**
 
 On success returns the HTTP `204 No Content` success status response code.
@@ -111,6 +115,10 @@ curl -X PUT "http://localhost:3689/api/player/pause"
 curl -X PUT "http://localhost:3689/api/player/stop"
 ```
 
+```shell
+curl -X PUT "http://localhost:3689/api/player/toggle"
+```
+
 
 ### Skip tracks
 
@@ -123,7 +131,7 @@ PUT /api/player/next
 ```
 
 ```http
-PUT /api/player/prev
+PUT /api/player/previous
 ```
 
 **Response**
@@ -137,7 +145,7 @@ curl -X PUT "http://localhost:3689/api/player/next"
 ```
 
 ```shell
-curl -X PUT "http://localhost:3689/api/player/prev"
+curl -X PUT "http://localhost:3689/api/player/previous"
 ```
 
 
@@ -240,8 +248,10 @@ PUT /api/player/volume
 | Parameter       | Value                                                       |
 | --------------- | ----------------------------------------------------------- |
 | volume          | The new volume (0 - 100)                                    |
+| step            | The increase or decrease volume by the given amount (-100 - 100) |
 | output_id       | *(Optional)* If an output id is given, only the volume of this output will be changed. If parameter is omited, the master volume will be changed. |
 
+Either `volume` or `step` must be present as query parameter
 
 **Response**
 
@@ -251,6 +261,10 @@ On success returns the HTTP `204 No Content` success status response code.
 
 ```shell
 curl -X PUT "http://localhost:3689/api/player/volume?volume=50"
+```
+
+```shell
+curl -X PUT "http://localhost:3689/api/player/volume?step=-5"
 ```
 
 ```shell
@@ -582,8 +596,14 @@ POST /api/queue/items/add
 
 | Parameter       | Value                                                       |
 | --------------- | ----------------------------------------------------------- |
-| uris            | Comma seperated list of resource identifiers (`track`, `playlist`, `artist` or `album` object `uri`) |
-| position        | *(Optional)* If a position is given, new items are inserted starting from this position into the queue.  |
+| uris            | Comma seperated list of resource identifiers (`track`, `playlist`, `artist` or `album` object `uri`)           |
+| expression      | A smart playlist query expression identifying the tracks that will be added to the queue.                          |
+| position        | *(Optional)* If a position is given, new items are inserted starting from this position into the queue.            |
+| playback        | *(Optional)* If the `playback` parameter is set to `start`, playback will be started after adding the new items. |
+| clear           | *(Optional)* If the `clear` parameter is set to `true`, the queue will be cleared before adding the new items.    |
+| shuffle         | *(Optional)* If the `shuffle` parameter is set to `true`, the shuffle mode is activated. If it is set to something else, the shuffle mode is deactivated. To leave the shuffle mode untouched the parameter should be ommited.    |
+
+Either the `uris` or the `expression` parameter must be set. If both are set the `uris` parameter takes presedence and the `expression` parameter will be ignored.
 
 **Response**
 
@@ -596,8 +616,22 @@ On success returns the HTTP `200 OK` success status response code.
 
 **Example**
 
+Add new items by uri:
+
 ```shell
 curl -X POST "http://localhost:3689/api/queue/items/add?uris=library:playlist:68,library:artist:2932599850102967727"
+```
+
+```json
+{
+  "count": 42
+}
+```
+
+Add new items by query language:
+
+```shell
+curl -X POST "http://localhost:3689/api/queue/items/add?expression=media_kind+is+music"
 ```
 
 ```json
@@ -682,9 +716,11 @@ curl -X PUT "http://localhost:3689/api/queue/items/2"
 | GET       | [/api/library/albums](#list-albums)                         | Get a list of albums                 |
 | GET       | [/api/library/albums/{id}](#get-an-album)                   | Get an album                         |
 | GET       | [/api/library/albums/{id}/tracks](#list-album-tracks)       | Get list of tracks for an album      |
+| GET       | [/api/library/tracks/{id}](#get-a-track)                    | Get a track                          |
+| PUT       | [/api/library/tracks/{id}](#update-track-properties)        | Update a tracks properties (rating, play_count) |
 | GET       | [/api/library/genres](#list-genres)                         | Get list of genres                   |
 | GET       | [/api/library/count](#get-count-of-tracks-artists-and-albums) | Get count of tracks, artists and albums |
-| GET       | [/api/library/files](#list-local-directories)               | Get list of directories in the local library  |
+| GET       | [/api/library/files](#list-local-directories)               | Get list of directories in the local library    |
 | GET       | [/api/update](#trigger-rescan)                              | Trigger a library rescan             |
 
 
@@ -1214,6 +1250,106 @@ curl -X GET "http://localhost:3689/api/library/albums/1/tracks"
   "offset": 0,
   "limit": -1
 }
+```
+
+
+### Get a track
+
+Get a specific track in your library
+
+**Endpoint**
+
+```http
+GET /api/library/tracks/{id}
+```
+
+**Path parameters**
+
+| Parameter       | Value                |
+| --------------- | -------------------- |
+| id              | Track id             |
+
+**Response**
+
+On success returns the HTTP `200 OK` success status response code. With the response body holding the **[`track`](#track-object) object**.
+
+
+**Example**
+
+```shell
+curl -X GET "http://localhost:3689/api/library/track/1"
+```
+
+```json
+{
+  "id": 1,
+  "title": "Pardon Me",
+  "title_sort": "Pardon Me",
+  "artist": "Incubus",
+  "artist_sort": "Incubus",
+  "album": "Make Yourself",
+  "album_sort": "Make Yourself",
+  "album_id": "6683985628074308431",
+  "album_artist": "Incubus",
+  "album_artist_sort": "Incubus",
+  "album_artist_id": "4833612337650426236",
+  "composer": "Alex Katunich/Brandon Boyd/Chris Kilmore/Jose Antonio Pasillas II/Mike Einziger",
+  "genre": "Alternative Rock",
+  "year": 2001,
+  "track_number": 12,
+  "disc_number": 1,
+  "length_ms": 223170,
+  "rating": 0,
+  "play_count": 0,
+  "skip_count": 0,
+  "time_added": "2019-01-20T11:58:29Z",
+  "date_released": "2001-05-27",
+  "seek_ms": 0,
+  "media_kind": "music",
+  "data_kind": "file",
+  "path": "/music/srv/Incubus/Make Yourself/12 Pardon Me.mp3",
+  "uri": "library:track:1",
+  "artwork_url": "/artwork/item/1"
+}
+```
+
+
+### Update track properties
+
+Change properties of a specific track (supported properties are "rating" and "play_count")
+
+**Endpoint**
+
+```http
+PUT /api/library/tracks/{id}
+```
+
+**Path parameters**
+
+| Parameter       | Value                |
+| --------------- | -------------------- |
+| id              | Track id             |
+
+**Query parameters**
+
+| Parameter       | Value                                                       |
+| --------------- | ----------------------------------------------------------- |
+| rating          | The new rating (0 - 100)                                    |
+| play_count      | Either `increment` or `reset`. `increment` will increment `play_count` and update `time_played`, `reset` will set `play_count` and `skip_count` to zero and delete `time_played` and `time_skipped` |
+
+
+**Response**
+
+On success returns the HTTP `204 No Content` success status response code.
+
+**Example**
+
+```shell
+curl -X PUT "http://localhost:3689/api/library/tracks/1?rating=100"
+```
+
+```shell
+curl -X PUT "http://localhost:3689/api/library/tracks/1?play_count=increment"
 ```
 
 
@@ -1778,6 +1914,7 @@ will send a message each time one of the events occurred.
 | Type            | Description                               |
 | --------------- | ----------------------------------------- |
 | update          | Library update started or finished        |
+| database        | Library database changed (new/modified/deleted tracks)  |
 | outputs         | An output was enabled or disabled         |
 | player          | Player state changes                      |
 | options         | Playback option changes (shuffle, repeat, consume mode) |
